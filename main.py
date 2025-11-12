@@ -23,9 +23,6 @@ EXECUTE_COMMAND = True
 # 1) Taskwarrior CLI ラッパ
 # ----------------------------------
 def tw(*args: str) -> subprocess.CompletedProcess:
-    """
-    Taskwarrior を実行する薄いラッパ。環境変数 TASK_WARRIOR_PATH が未設定なら 'task' を PATH から探す。
-    """
     task_path = os.environ.get("TASK_WARRIOR_PATH", "task")
     return subprocess.run(
         [task_path] + list(args),
