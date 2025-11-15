@@ -4,35 +4,40 @@ import shlex
 import json
 import subprocess
 import dotenv
-from datetime import datetime
-from typing import TypedDict, Optional, List, Dict, Any
+from typing import Dict, Any
 
 from langchain.agents import create_agent
 from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI  # 任意のプロバイダに置換可（model名だけ合わせる）
-from langchain.messages import ToolMessage
+from langchain_openai import ChatOpenAI
+from langgraph.checkpoint.memory import InMemorySaver  
 
 dotenv.load_dotenv()
 
 # ----------------------------------
-# 0) 実行フラグ（まずは生成のみ→安全）
-# ----------------------------------
-EXECUTE_COMMAND = True
-
-# ----------------------------------
-# 1) Taskwarrior CLI ラッパ
+# Taskwarrior CLI ラッパ
 # ----------------------------------
 def tw(*args: str) -> subprocess.CompletedProcess:
     task_path = os.environ.get("TASK_WARRIOR_PATH", "task")
+
+    base = [
+        task_path,
+        "rc.confirmation=off",
+        "rc.recurrence.confirmation=off",
+        "rc.dependency.confirmation=off",
+        "rc.bulk=0",
+    ]
+
     return subprocess.run(
-        [task_path] + list(args),
+        base + list(args),
         capture_output=True,
         text=True,
         check=False,
     )
 
+
 # ----------------------------------
-# 2) Taskwarriorの“コンテキスト”（使い方ガイド）
+# Taskwarriorの“コンテキスト”（使い方ガイド）
+#   → プロンプト内で参照するだけ
 # ----------------------------------
 TASKWARRIOR_GUIDE = r"""
 Usage: task                                                   Runs rc.default.command, if specified.
@@ -120,7 +125,7 @@ Usage: task                                                   Runs rc.default.co
        task <filter> _projects                                Shows only a list of all project names used
        task          _show                                    Shows all configuration settings in a machine-readable format
        task <filter> _tags                                    Shows only a list of all tags used, for autocompletion purposes
-       task          _udas                                    Shows the defined UDAs for completion purposes
+       task          _udas                                    Shows all the defined UDA details, for completion purposes
        task <filter> _unique <attribute>                      Generates lists of unique attribute values
        task <filter> _urgency                                 Displays the urgency measure of a task
        task <filter> _uuids                                   Shows the UUIDs of matching tasks, as a list
@@ -138,97 +143,136 @@ Usage: task                                                   Runs rc.default.co
 """
 
 # ----------------------------------
-# 3) ツール：出力を固定化（JSONコンテナ）
+# ツール定義
 # ----------------------------------
-class CommandSpec(TypedDict):
-    command: str   # 例: task add "企画書ドラフト" due:fri +work priority:M assignee:U123
-    reason: str    # どう解釈してこのコマンドになったか
 
-@tool("emit_command", return_direct=True)
-def emit_command(cmd: str, reason: Optional[str] = None) -> CommandSpec:
+@tool("task_export")
+def task_export(filter_: str = "") -> str:
     """
-    最終出力コンテナ。モデルはこのツールを1回だけ呼ぶ。
-    ここでは生成のみ。実行は run() 側でフラグに応じて行う。
+    Taskwarrior のタスクを JSON で取得する。
+    filter_ には通常のフィルタ式（例: 'status:pending', 'id.not:7' など）を入れる。
+    戻り値は JSON 文字列（配列）。
     """
-    return {"command": cmd.strip(), "reason": (reason or "").strip()}
+    args = []
+    if filter_:
+        args.append(filter_)
+    args += ["export"]
+
+    proc = tw(*args)
+    return proc.stdout  # JSON
+
+DANGEROUS_SUBSTRINGS = [" purge", " rm ", " synchronize", " import-v2"]
+
+@tool("task_cli")
+def task_cli(cmd: str) -> str:
+    """
+    任意の Taskwarrior コマンドを実行する。
+    ただし、極端に破壊的な操作（purge 等）はブロックする。
+    """
+    for bad in DANGEROUS_SUBSTRINGS:
+        if bad in cmd:
+            return f"ERROR: dangerous command blocked: {cmd}"
+
+    args = shlex.split(cmd)
+    if args and args[0] == "task":
+        args = args[1:]
+
+    proc = tw(*args)
+    return proc.stdout or proc.stderr
+
+@tool("task_run")
+def task_run(cmd: str) -> str:
+    """
+    Taskwarrior コマンドを実行して、その結果を JSON 文字列で返す。
+    """
+    args = shlex.split(cmd)
+    if args and args[0] == "task":
+        args = args[1:]
+
+    proc = tw(*args)
+    result = {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+    return json.dumps(result, ensure_ascii=False)
 
 # ----------------------------------
-# 4) システムプロンプト
+# システムプロンプト
 # ----------------------------------
 SYSTEM_PROMPT = f"""
-あなたは Taskwarrior コマンド作成アシスタントです。
-ユーザーの自然文を Taskwarrior コマンドに安全に正規化してください。
+あなたは、ユーザーのタスク管理を手伝う「人間のアシスタント」です。
+裏側では Taskwarrior を使いますが、そのことは一切ユーザーに悟られてはいけません。
+
+あなたは次のツールを使えます:
+
+- task_export(filter_: str = "")
+  - タスクを JSON で取得するために使います。
+- task_cli(cmd: str)
+  - 状態確認など、補助的に使って構いません。
+- task_run(cmd: str)
+  - 実際に操作を行いたいときに使います。
+  - 戻り値の JSON に stdout / stderr / returncode が入っています。
 
 # コンテキスト（リファレンス）
 {TASKWARRIOR_GUIDE}
 
 # 重要ルール
-- 出力は必ず tool `emit_command` を1回だけ実行して返すこと。
-- 返すのは “実行可能な1行のコマンド” と、その短い理由（日本語）。
-- 不明点があっても推測で安全側に寄せる（例: 期日が「金曜」だけなら due:fri を使う）。
-- タグは `+tag` 形式、優先度は `priority:H|M|L`。期日は `due:`。担当は `assignee:`。
-- すでにIDが明示されている操作（done/modify/assign）は ID をそのまま使う。
-- 実行はしない（生成のみ）。壊れる可能性のある曖昧パラメータは避ける（不必要な削除などは出さない）。
+- ユーザーの依頼を理解したら、
+  - 必要に応じて task_export などで現在のタスク状態を確認し、
+  - 実際に操作が必要な場合は task_run を呼んでください。
+- その後、ツールの結果（タスク一覧やエラー内容）を読み取り、
+  最後は「人間のアシスタント」として自然な日本語でユーザーに説明して終了してください。
+- ユーザーには「Taskwarrior」「コマンド」「CLI」「stdout」「stderr」などの単語は一切見せてはいけません。
+- 行数が多いタスク一覧は、そのまま貼らずに要約してください。
+- 危険そうな操作（一括削除など）の場合は、
+  実行前に task_export で対象を確認し、必要ならユーザーに確認する文言を含めてください。
 """
 
 # ----------------------------------
-# 5) エージェント生成
+# エージェント生成
 # ----------------------------------
 llm = ChatOpenAI(model="gpt-5-mini", temperature=0)
 
 agent = create_agent(
     model=llm,
-    tools=[emit_command],
+    tools=[task_export, task_cli, task_run],
     system_prompt=SYSTEM_PROMPT,
+    checkpointer=InMemorySaver(),
 )
 
 # ----------------------------------
-# 6) 実行ラッパ（生成→必要なら即実行）
+# エントリポイント
 # ----------------------------------
 def run(query: str) -> Dict[str, Any]:
     """
-    自然文 -> emit_command(JSON) を得て、
-    EXECUTE_COMMAND=True の場合は Taskwarrior を実行して結果を返す。
+    自然文 -> agent（内部で task_export / task_run などを実行）
+            -> 人間向けの返答をそのまま返す
     """
-    res = agent.invoke({"messages": [{"role": "user", "content": query}]})
-    # create_agent の戻り shape は実装で差があるが、emit_command(return_direct=True) なら
-    # 通常 res は dict(CommandSpec) か、それに準ずる content を持つ
-    if isinstance(res, dict) and "command" in res:
-        cmd = res["command"]
-        reason = res.get("reason", "")
+    res = agent.invoke(
+        {"messages": [{"role": "user", "content": query}]},
+        {"configurable": {"thread_id": "1"}}
+    )
+
+    # create_agent はだいたい {"messages": [...]} を返す。
+    # 最後の AIMessage の content をユーザー向け返答として扱う。
+    if isinstance(res, dict) and "messages" in res:
+        msgs = res["messages"]
+        if msgs:
+            reply = getattr(msgs[-1], "content", "") or ""
+        else:
+            reply = ""
     else:
-        # 念のためフォールバック（content 側に dict が入ってくる実装もある）
-        maybe = getattr(res, "content", res)
-        for message in maybe["messages"]:
-            if isinstance(message, ToolMessage):
-                payload = json.loads(message.content)
-                cmd = payload.get("command", "")
-                reason = payload.get("reason", "")
+        reply = getattr(res, "content", str(res))
 
-    out: Dict[str, Any] = {"generated": {"command": cmd, "reason": reason}}
+    return {"reply": reply}
 
-    if EXECUTE_COMMAND:
-        # 引用を考慮して shlex.split
-        args = shlex.split(cmd)
-        print(args)
-        proc = tw(*args[1:])
-        out["exec"] = {
-            "returncode": proc.returncode,
-            "stdout": proc.stdout,
-            "stderr": proc.stderr,
-        }
-    return out
 
-# ----------------------------------
-# 7) 簡易テスト
-# ----------------------------------
 if __name__ == "__main__":
-    tests: List[str] = [
-        "金曜までに『競合調査メモ』を @alice に振って。タグは #research",
-        "今の自分のタスク見せて",
-        "請求のやつ探して",
-        "ID 42 を完了にして",
-        "ID 98 の期日を来週月曜に変更して",
-    ]
-    for q in tests:
+    while True:
+        q = input("msg: ")
+        if not q:
+            continue
         result = run(q)
+        print("--- REPLY ---")
+        print(result["reply"])
